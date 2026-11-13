@@ -147,6 +147,19 @@ class ModelResponsePartsManager:
             if not isinstance(p, ToolCallPartDelta)
         ]
 
+    def get_part(self, index: int) -> ModelResponsePart | None:
+        """Return a complete part at its unfiltered stream index, or None for a dangling tool-call delta."""
+        if index < 0 or index >= len(self._parts):
+            return None
+        if index in self._string_buffers and not isinstance(self._parts[index], ToolCallPartDelta):
+            self._materialize_and_cache_part(index)
+        part = self._parts[index]
+        if isinstance(part, ToolCallPartDelta):
+            return None
+        if restorer := self.special_token_restorer:
+            return restorer.restore_part_so_far(index, part)
+        return part
+
     def get_part_by_vendor_id(self, vendor_id: VendorId) -> ManagedPart | None:
         """Return a part by its vendor ID.
 

@@ -38,6 +38,7 @@ from pydantic_ai import (
     ModelServerError,
     PartDeltaEvent,
     PartEndEvent,
+    PartStartEvent,
     RetryFeedbackPart,
     RetryInfo,
     RunContext,
@@ -8241,3 +8242,65 @@ async def test_non_json_response_body_raises_model_api_error(
 
     assert isinstance(exc_info.value.__cause__, cause)
     assert exc_info.value.message.startswith('Failed to decode response as JSON')
+
+
+async def test_stream_dangling_tool_call_delta_keeps_part_end_events_consistent(
+    allow_model_requests: None,
+):
+    """A nameless tool-call delta must not shift the parts carried by later end events."""
+    first_turn = [
+        chunk(
+            [
+                ChoiceDelta(
+                    tool_calls=[
+                        ChoiceDeltaToolCall(
+                            index=0,
+                            id='call_0',
+                            function=ChoiceDeltaToolCallFunction(name='get_location', arguments='{}'),
+                        )
+                    ]
+                )
+            ]
+        ),
+        chunk(
+            [
+                ChoiceDelta(
+                    tool_calls=[
+                        ChoiceDeltaToolCall(
+                            index=1,
+                            function=ChoiceDeltaToolCallFunction(arguments='{"city"'),
+                        )
+                    ]
+                )
+            ]
+        ),
+        text_chunk('Hello there'),
+        text_chunk('.', finish_reason='tool_calls'),
+    ]
+    second_turn = [text_chunk('done'), text_chunk('.', finish_reason='stop')]
+    mock_client = MockOpenAI.create_mock_stream([first_turn, second_turn])
+    model = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=mock_client))
+
+    def get_location() -> str:
+        return 'Paris'
+
+    agent = Agent(model, tools=[get_location], output_type=[str])
+
+    turns: list[list[object]] = []
+    async with agent.iter('') as run:
+        async for node in run:
+            if agent.is_model_request_node(node):
+                turn_events: list[object] = []
+                async with node.stream(run.ctx) as stream_events:
+                    async for event in stream_events:
+                        turn_events.append(event)
+                turns.append(turn_events)
+
+    starts = {event.index: event for event in turns[0] if isinstance(event, PartStartEvent)}
+    ends = [event for event in turns[0] if isinstance(event, PartEndEvent)]
+    assert 2 in starts and isinstance(starts[2].part, TextPart)
+    for end in ends:
+        assert type(end.part) is type(starts[end.index].part)
+
+    text_end = next(event for event in ends if event.index == 2)
+    assert isinstance(text_end.part, TextPart) and text_end.part.content == 'Hello there.'

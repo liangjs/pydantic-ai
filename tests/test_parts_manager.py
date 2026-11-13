@@ -20,6 +20,7 @@ from pydantic_ai import (
 )
 from pydantic_ai._deferred_capabilities import LoadCapabilityCallPart
 from pydantic_ai._parts_manager import ModelResponsePartsManager
+from pydantic_ai._special_tokens import StreamRestorer
 from pydantic_ai.messages import ModelResponseStreamEvent
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.tools import ToolDefinition
@@ -1158,6 +1159,33 @@ def test_get_part_by_vendor_id():
     assert part == snapshot(TextPart(content='hello', part_kind='text'))
 
     assert manager.get_part_by_vendor_id('missing') is None
+
+
+def test_get_part_resolves_in_the_unfiltered_index_space():
+    """Single-part lookup uses the same index space as `PartStartEvent`."""
+    manager = ModelResponsePartsManager(model_request_parameters=ModelRequestParameters())
+
+    assert manager.handle_tool_call_delta(vendor_part_id='tool', args='{"value":') is None
+    assert manager.get_part(0) is None
+
+    next(manager.handle_text_delta(vendor_part_id='content', content='hello'))
+    assert manager.get_part(1) == TextPart(content='hello', part_kind='text')
+
+    manager.handle_tool_call_delta(vendor_part_id='complete', tool_name='lookup', args='{"value":')
+    manager.handle_tool_call_delta(vendor_part_id='complete', args='1}')
+    assert manager.get_part(2) == ToolCallPart(tool_name='lookup', args='{"value":1}', tool_call_id=IsStr())
+
+    assert manager.get_part(-1) is None
+    assert manager.get_part(3) is None
+
+
+def test_get_part_applies_special_token_restoration():
+    manager = ModelResponsePartsManager(model_request_parameters=ModelRequestParameters())
+    next(manager.handle_text_delta(vendor_part_id='content', content='<\u200d|im_start|>'))
+    manager.special_token_restorer = StreamRestorer()
+
+    assert manager.get_part(0) == TextPart(content='<|im_start|>')
+    assert manager.get_part(0) == manager.get_parts()[0]
 
 
 def test_apply_event_preserves_stream_part_indexes():
